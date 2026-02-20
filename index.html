@@ -39,10 +39,10 @@
         </div>
 
         <div class="stats-grid">
-            <div class="stat-box"><span class="stat-label">MOS Score</span><div id="ui-mos">-</div></div>
-            <div class="stat-box"><span class="stat-label">Latency (RTT)</span><div id="ui-latency">-</div></div>
-            <div class="stat-box"><span class="stat-label">Jitter</span><div id="ui-jitter">-</div></div>
-            <div class="stat-box"><span class="stat-label">Packet Loss</span><div id="ui-loss">-</div></div>
+            <div class="stat-box"><span class="stat-label">MOS Score</span><div id="ui-mos" class="stat-value">-</div></div>
+            <div class="stat-box"><span class="stat-label">Latency (RTT)</span><div id="ui-latency" class="stat-value">-</div></div>
+            <div class="stat-box"><span class="stat-label">Jitter</span><div id="ui-jitter" class="stat-value">-</div></div>
+            <div class="stat-box"><span class="stat-label">Packet Loss</span><div id="ui-loss" class="stat-value">-</div></div>
         </div>
 
         <div class="chart-container">
@@ -69,6 +69,7 @@ let currentStartTime = "";
 const setStatus = (msg) => { document.getElementById('statusLabel').innerText = msg; };
 const setTimerText = (msg) => { document.getElementById('timerText').innerText = msg; };
 
+// --- Xirsys ICE Servers (Logic explicitly as provided) ---
 const ICE_CONFIG = {
   iceServers: [
     { urls: ["stun:bn-turn2.xirsys.com"] },
@@ -137,6 +138,7 @@ function promptAndRunTest() {
     }
 }
 
+// Candidate Filter Logic
 function installCandidateFilter(srcPc, forwardPc) {
   srcPc.addEventListener('icecandidate', ev => {
     if (!ev.candidate) return;
@@ -146,6 +148,7 @@ function installCandidateFilter(srcPc, forwardPc) {
   });
 }
 
+// DC Robust Wait Logic
 function waitForDcOpenOrConnected(dc, pc, timeoutMs = 20000) {
   return new Promise((resolve, reject) => {
     let done = false;
@@ -153,7 +156,7 @@ function waitForDcOpenOrConnected(dc, pc, timeoutMs = 20000) {
     const onConnState = () => {
       const s = pc.connectionState || pc.iceConnectionState;
       if ((s === 'connected' || s === 'completed') && !done) { cleanup(); resolve(); }
-      else if ((s === 'failed' || s === 'disconnected') && !done) { cleanup(); reject(new Error('PC Failed')); }
+      else if ((s === 'failed' || s === 'disconnected' || s === 'closed') && !done) { cleanup(); reject(new Error('PeerConnection failed: ' + s)); }
     };
     dc.onopen = () => { if (!done) { cleanup(); resolve(); } };
     pc.addEventListener('connectionstatechange', onConnState);
@@ -161,6 +164,7 @@ function waitForDcOpenOrConnected(dc, pc, timeoutMs = 20000) {
   });
 }
 
+// RTT Extraction Logic
 function extractOutboundRttMs(stats) {
   const rtts = [];
   stats.forEach(rep => {
@@ -170,8 +174,10 @@ function extractOutboundRttMs(stats) {
   return rtts.length ? rtts.reduce((a, b) => a + b, 0) / rtts.length : null;
 }
 
+// --- MAIN ENGINE (Logic exactly as provided) ---
 async function runVoipTest(durationSec) {
   perSecondData = [];
+  window.__webrtc_rtts = [];
   initChart();
   document.getElementById('exportBtn').style.display = 'none';
   setStatus('VoIP test running');
@@ -179,6 +185,7 @@ async function runVoipTest(durationSec) {
   try {
     const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
     const oscillator = audioCtx.createOscillator();
+    oscillator.frequency.value = 440; 
     const dest = audioCtx.createMediaStreamDestination();
     oscillator.connect(dest); oscillator.start();
     const stream = dest.stream;
@@ -189,10 +196,12 @@ async function runVoipTest(durationSec) {
     installCandidateFilter(pcSender, pcReceiver);
     installCandidateFilter(pcReceiver, pcSender);
 
-    pcReceiver.ontrack = (e) => { document.getElementById('remoteAudio').srcObject = e.streams[0]; };
+    pcReceiver.ontrack = (e) => { 
+        document.getElementById('remoteAudio').srcObject = e.streams[0]; 
+    };
     stream.getTracks().forEach(t => pcSender.addTrack(t, stream));
 
-    dataChannel = pcSender.createDataChannel('ping');
+    dataChannel = pcSender.createDataChannel('ping', { ordered: true });
     pcReceiver.ondatachannel = ev => { ev.channel.onmessage = m => ev.channel.send(m.data); };
 
     const offer = await pcSender.createOffer();
@@ -205,31 +214,39 @@ async function runVoipTest(durationSec) {
     await waitForDcOpenOrConnected(dataChannel, pcSender);
 
     pingInterval = setInterval(() => {
-      if (dataChannel.readyState === 'open') dataChannel.send(JSON.stringify({ sentTs: performance.now() }));
+      if (dataChannel.readyState === 'open') {
+          dataChannel.send(JSON.stringify({ sentTs: performance.now() }));
+      }
     }, 1000);
 
     dataChannel.onmessage = ev => {
-        const pkt = JSON.parse(ev.data);
-        window.__webrtc_rtts.push(performance.now() - pkt.sentTs);
+        try {
+            const pkt = JSON.parse(ev.data);
+            if (pkt.sentTs) window.__webrtc_rtts.push(performance.now() - pkt.sentTs);
+        } catch(e) {}
     };
 
+    // --- Stats Collection Loop (Explicitly capturing each value per second) ---
     for (let i = durationSec; i >= 1; i--) {
       setTimerText(`${i}s`);
       const statsRx = await pcReceiver.getStats();
       const statsTx = await pcSender.getStats();
 
-      let jitter = 0, loss = 0, rx = 0, lost = 0;
+      let jitter = 0, loss = 0, rxPackets = 0, lostPackets = 0;
       statsRx.forEach(r => {
-        if (r.type === 'inbound-rtp' && r.kind === 'audio') {
+        if (r.type === 'inbound-rtp' && (r.kind === 'audio' || r.mediaType === 'audio')) {
           jitter = (r.jitter || 0) * 1000;
-          rx = r.packetsReceived || 0; lost = r.packetsLost || 0;
-          loss = (rx + lost) ? (lost / (rx + lost)) * 100 : 0;
+          rxPackets = r.packetsReceived || 0; 
+          lostPackets = r.packetsLost || 0;
+          const total = rxPackets + lostPackets;
+          loss = total ? (lostPackets / total) * 100 : 0;
         }
       });
 
       const netRtt = extractOutboundRttMs(statsTx);
-      const latency = netRtt || (window.__webrtc_rtts[window.__webrtc_rtts.length - 1] || 0);
+      const latency = netRtt || (window.__webrtc_rtts.length ? window.__webrtc_rtts[window.__webrtc_rtts.length - 1] : 0);
 
+      // MOS Logic exactly as provided
       let R = 94.2 - (latency * 0.03 + jitter * 0.10 + loss * 2.5);
       R = Math.max(0, Math.min(100, R));
       const MOS = 1 + 0.035 * R + 0.000007 * R * (R - 60) * (100 - R);
@@ -237,6 +254,7 @@ async function runVoipTest(durationSec) {
       const secondMark = durationSec - i + 1;
       const currentTickTime = new Date().toLocaleTimeString();
       
+      // Store exact values for Excel
       perSecondData.push({ 
           time: secondMark, 
           timestamp: currentTickTime,
@@ -246,6 +264,7 @@ async function runVoipTest(durationSec) {
           mos: MOS.toFixed(2) 
       });
       
+      // Update Chart and UI
       chart.data.labels.push(secondMark + 's');
       chart.data.datasets[0].data.push(MOS.toFixed(2));
       chart.data.datasets[1].data.push(latency.toFixed(0));
@@ -254,7 +273,7 @@ async function runVoipTest(durationSec) {
       document.getElementById('ui-mos').innerText = MOS.toFixed(2);
       document.getElementById('ui-latency').innerText = Math.round(latency) + "ms";
       document.getElementById('ui-jitter').innerText = jitter.toFixed(2) + "ms";
-      document.getElementById('ui-loss').innerText = loss.toFixed(1) + "%";
+      document.getElementById('ui-loss').innerText = loss.toFixed(2) + "%";
 
       await new Promise(r => setTimeout(r, 1000));
     }
@@ -263,7 +282,9 @@ async function runVoipTest(durationSec) {
     setStatus('Test Complete');
     document.getElementById('exportBtn').style.display = 'block';
     pcSender.close(); pcReceiver.close(); oscillator.stop(); audioCtx.close();
+
   } catch (err) {
+    clearInterval(pingInterval);
     setStatus('Error: ' + err.message);
   }
 }
@@ -277,7 +298,7 @@ function downloadCsv() {
     const blob = new Blob([csv], { type: 'text/csv' });
     const url = window.URL.createObjectURL(blob);
     const a = document.createElement('a');
-    a.href = url; a.download = `VoIP_Report_${new Date().getTime()}.csv`; a.click();
+    a.href = url; a.download = `VoIP_Detailed_Report.csv`; a.click();
 }
 </script>
 </body>
