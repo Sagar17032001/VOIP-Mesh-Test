@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>WebRTC VoIP Diagnostic with Real-time Charts</title>
+    <title>WebRTC VoIP Diagnostic with Date/Time Stamp</title>
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <style>
         :root { --primary: #2563eb; --success: #10b981; --danger: #ef4444; --bg: #f8fafc; }
@@ -17,11 +17,12 @@
         .stat-label { font-size: 0.75rem; font-weight: 700; color: #64748b; text-transform: uppercase; margin-bottom: 0.5rem; display: block; }
         .stat-value { font-size: 1.4rem; font-weight: 700; color: #0f172a; }
         .chart-container { position: relative; height: 300px; width: 100%; margin-top: 1rem; }
-        .controls { display: flex; gap: 1rem; margin-top: 1.5rem; }
+        .controls { display: flex; gap: 1rem; margin-top: 1.5rem; align-items: center; }
         button { padding: 0.75rem 1.5rem; border-radius: 6px; border: none; font-weight: 600; cursor: pointer; }
         .btn-start { background: var(--primary); color: white; }
         .btn-export { background: var(--success); color: white; display: none; }
         .status-bar { font-size: 0.875rem; color: #64748b; }
+        .timestamp-info { font-size: 0.85rem; color: #64748b; margin-top: 5px; font-style: italic; }
     </style>
 </head>
 <body>
@@ -31,7 +32,8 @@
         <div class="header">
             <div>
                 <h1 style="margin:0">VoIP Quality Test</h1>
-                <div class="status-bar">Status: <span id="statusLabel">Idle</span></div>
+                <div class="status-bar">Status: <b id="statusLabel">Idle</b></div>
+                <div id="testTimestamp" class="timestamp-info"></div>
             </div>
             <div id="timerText" class="timer">0s</div>
         </div>
@@ -62,11 +64,11 @@ window.__webrtc_rtts = [];
 let pingInterval = null;
 let perSecondData = [];
 let chart = null;
+let currentStartTime = "";
 
 const setStatus = (msg) => { document.getElementById('statusLabel').innerText = msg; };
 const setTimerText = (msg) => { document.getElementById('timerText').innerText = msg; };
 
-// --- ICE CONFIG ---
 const ICE_CONFIG = {
   iceServers: [
     { urls: ["stun:bn-turn2.xirsys.com"] },
@@ -85,7 +87,6 @@ const ICE_CONFIG = {
   ]
 };
 
-// Initialize Chart
 function initChart() {
     const ctx = document.getElementById('voipChart').getContext('2d');
     if (chart) chart.destroy();
@@ -128,13 +129,14 @@ function promptAndRunTest() {
     const duration = prompt("Enter test duration in seconds (e.g. 20, 60):", "20");
     const seconds = parseInt(duration);
     if (!isNaN(seconds) && seconds > 0) {
+        currentStartTime = new Date().toLocaleString();
+        document.getElementById('testTimestamp').innerText = "Test Started: " + currentStartTime;
         runVoipTest(seconds);
     } else {
         alert("Please enter a valid number.");
     }
 }
 
-// --- UTILITIES ---
 function installCandidateFilter(srcPc, forwardPc) {
   srcPc.addEventListener('icecandidate', ev => {
     if (!ev.candidate) return;
@@ -168,7 +170,6 @@ function extractOutboundRttMs(stats) {
   return rtts.length ? rtts.reduce((a, b) => a + b, 0) / rtts.length : null;
 }
 
-// --- MAIN ENGINE ---
 async function runVoipTest(durationSec) {
   perSecondData = [];
   initChart();
@@ -233,9 +234,17 @@ async function runVoipTest(durationSec) {
       R = Math.max(0, Math.min(100, R));
       const MOS = 1 + 0.035 * R + 0.000007 * R * (R - 60) * (100 - R);
 
-      // Record & Chart Update
       const secondMark = durationSec - i + 1;
-      perSecondData.push({ time: secondMark, latency: latency.toFixed(2), jitter: jitter.toFixed(2), loss: loss.toFixed(2), mos: MOS.toFixed(2) });
+      const currentTickTime = new Date().toLocaleTimeString();
+      
+      perSecondData.push({ 
+          time: secondMark, 
+          timestamp: currentTickTime,
+          latency: latency.toFixed(2), 
+          jitter: jitter.toFixed(2), 
+          loss: loss.toFixed(2), 
+          mos: MOS.toFixed(2) 
+      });
       
       chart.data.labels.push(secondMark + 's');
       chart.data.datasets[0].data.push(MOS.toFixed(2));
@@ -260,12 +269,15 @@ async function runVoipTest(durationSec) {
 }
 
 function downloadCsv() {
-    let csv = "Second,Latency (ms),Jitter (ms),Packet Loss (%),MOS Score\n";
-    perSecondData.forEach(row => { csv += `${row.time},${row.latency},${row.jitter},${row.loss},${row.mos}\n`; });
+    let csv = "Test Date: " + currentStartTime + "\n";
+    csv += "Second,Clock Time,Latency (ms),Jitter (ms),Packet Loss (%),MOS Score\n";
+    perSecondData.forEach(row => { 
+        csv += `${row.time},${row.timestamp},${row.latency},${row.jitter},${row.loss},${row.mos}\n`; 
+    });
     const blob = new Blob([csv], { type: 'text/csv' });
     const url = window.URL.createObjectURL(blob);
     const a = document.createElement('a');
-    a.href = url; a.download = `VoIP_Report.csv`; a.click();
+    a.href = url; a.download = `VoIP_Report_${new Date().getTime()}.csv`; a.click();
 }
 </script>
 </body>
