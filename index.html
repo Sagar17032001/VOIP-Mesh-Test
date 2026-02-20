@@ -1,0 +1,272 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WebRTC VoIP Diagnostic with Real-time Charts</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <style>
+        :root { --primary: #2563eb; --success: #10b981; --danger: #ef4444; --bg: #f8fafc; }
+        body { font-family: -apple-system, system-ui, sans-serif; background: var(--bg); padding: 2rem; color: #1e293b; }
+        .container { max-width: 1000px; margin: 0 auto; }
+        .card { background: white; padding: 2rem; border-radius: 12px; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.1); margin-bottom: 1.5rem; }
+        .header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 1.5rem; border-bottom: 2px solid #f1f5f9; padding-bottom: 1rem; }
+        .timer { font-size: 2.5rem; font-weight: 800; color: var(--danger); font-family: monospace; }
+        .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 1rem; margin-bottom: 1.5rem; }
+        .stat-box { background: #f1f5f9; padding: 1rem; border-radius: 8px; text-align: center; border: 1px solid #e2e8f0; }
+        .stat-label { font-size: 0.75rem; font-weight: 700; color: #64748b; text-transform: uppercase; margin-bottom: 0.5rem; display: block; }
+        .stat-value { font-size: 1.4rem; font-weight: 700; color: #0f172a; }
+        .chart-container { position: relative; height: 300px; width: 100%; margin-top: 1rem; }
+        .controls { display: flex; gap: 1rem; margin-top: 1.5rem; }
+        button { padding: 0.75rem 1.5rem; border-radius: 6px; border: none; font-weight: 600; cursor: pointer; }
+        .btn-start { background: var(--primary); color: white; }
+        .btn-export { background: var(--success); color: white; display: none; }
+        .status-bar { font-size: 0.875rem; color: #64748b; }
+    </style>
+</head>
+<body>
+
+<div class="container">
+    <div class="card">
+        <div class="header">
+            <div>
+                <h1 style="margin:0">VoIP Quality Test</h1>
+                <div class="status-bar">Status: <span id="statusLabel">Idle</span></div>
+            </div>
+            <div id="timerText" class="timer">0s</div>
+        </div>
+
+        <div class="stats-grid">
+            <div class="stat-box"><span class="stat-label">MOS Score</span><div id="ui-mos">-</div></div>
+            <div class="stat-box"><span class="stat-label">Latency (RTT)</span><div id="ui-latency">-</div></div>
+            <div class="stat-box"><span class="stat-label">Jitter</span><div id="ui-jitter">-</div></div>
+            <div class="stat-box"><span class="stat-label">Packet Loss</span><div id="ui-loss">-</div></div>
+        </div>
+
+        <div class="chart-container">
+            <canvas id="voipChart"></canvas>
+        </div>
+
+        <div class="controls">
+            <button id="startBtn" class="btn-start" onclick="promptAndRunTest()">Start Diagnostic</button>
+            <button id="exportBtn" class="btn-export" onclick="downloadCsv()">Export Excel (CSV)</button>
+        </div>
+    </div>
+</div>
+
+<audio id="remoteAudio" autoplay style="display:none"></audio>
+
+<script>
+let pcSender = null, pcReceiver = null, dataChannel = null;
+window.__webrtc_rtts = [];
+let pingInterval = null;
+let perSecondData = [];
+let chart = null;
+
+const setStatus = (msg) => { document.getElementById('statusLabel').innerText = msg; };
+const setTimerText = (msg) => { document.getElementById('timerText').innerText = msg; };
+
+// --- ICE CONFIG ---
+const ICE_CONFIG = {
+  iceServers: [
+    { urls: ["stun:bn-turn2.xirsys.com"] },
+    {
+      username: "QUijarzyJrAuEwKQeJZur1wEBSaxGg2ai6_AMivWz8QG-0yw50-lT8b4K127NeBnAAAAAGk71fNTYWdhclNhbXJhdA==",
+      credential: "c979c5b0-d736-11f0-849c-0242ac140004",
+      urls: [
+        "turn:bn-turn2.xirsys.com:80?transport=udp",
+        "turn:bn-turn2.xirsys.com:3478?transport=udp",
+        "turn:bn-turn2.xirsys.com:80?transport=tcp",
+        "turn:bn-turn2.xirsys.com:3478?transport=tcp",
+        "turns:bn-turn2.xirsys.com:443?transport=tcp",
+        "turns:bn-turn2.xirsys.com:5349?transport=tcp"
+      ]
+    }
+  ]
+};
+
+// Initialize Chart
+function initChart() {
+    const ctx = document.getElementById('voipChart').getContext('2d');
+    if (chart) chart.destroy();
+    chart = new Chart(ctx, {
+        type: 'line',
+        data: {
+            labels: [],
+            datasets: [
+                {
+                    label: 'MOS Score (1-4.5)',
+                    borderColor: '#2563eb',
+                    backgroundColor: 'rgba(37, 99, 235, 0.1)',
+                    data: [],
+                    yAxisID: 'y',
+                    tension: 0.3,
+                    fill: true
+                },
+                {
+                    label: 'Latency (ms)',
+                    borderColor: '#ef4444',
+                    borderDash: [5, 5],
+                    data: [],
+                    yAxisID: 'y1',
+                    tension: 0.3
+                }
+            ]
+        },
+        options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            scales: {
+                y: { type: 'linear', display: true, position: 'left', min: 1, max: 5, title: { display: true, text: 'MOS' } },
+                y1: { type: 'linear', display: true, position: 'right', grid: { drawOnChartArea: false }, title: { display: true, text: 'Latency (ms)' } }
+            }
+        }
+    });
+}
+
+function promptAndRunTest() {
+    const duration = prompt("Enter test duration in seconds (e.g. 20, 60):", "20");
+    const seconds = parseInt(duration);
+    if (!isNaN(seconds) && seconds > 0) {
+        runVoipTest(seconds);
+    } else {
+        alert("Please enter a valid number.");
+    }
+}
+
+// --- UTILITIES ---
+function installCandidateFilter(srcPc, forwardPc) {
+  srcPc.addEventListener('icecandidate', ev => {
+    if (!ev.candidate) return;
+    const cand = ev.candidate.candidate || '';
+    if (/\btyp host\b/i.test(cand) || /candidate:.* host /i.test(cand)) return;
+    forwardPc.addIceCandidate(ev.candidate).catch(() => {});
+  });
+}
+
+function waitForDcOpenOrConnected(dc, pc, timeoutMs = 20000) {
+  return new Promise((resolve, reject) => {
+    let done = false;
+    const cleanup = () => { done = true; clearTimeout(tid); };
+    const onConnState = () => {
+      const s = pc.connectionState || pc.iceConnectionState;
+      if ((s === 'connected' || s === 'completed') && !done) { cleanup(); resolve(); }
+      else if ((s === 'failed' || s === 'disconnected') && !done) { cleanup(); reject(new Error('PC Failed')); }
+    };
+    dc.onopen = () => { if (!done) { cleanup(); resolve(); } };
+    pc.addEventListener('connectionstatechange', onConnState);
+    const tid = setTimeout(() => { if (!done) { cleanup(); reject(new Error('Timeout')); } }, timeoutMs);
+  });
+}
+
+function extractOutboundRttMs(stats) {
+  const rtts = [];
+  stats.forEach(rep => {
+    if ((rep.type === 'outbound-rtp' || rep.type === 'candidate-pair') && typeof rep.roundTripTime === 'number') rtts.push(rep.roundTripTime * 1000);
+    if (rep.type === 'candidate-pair' && typeof rep.currentRoundTripTime === 'number') rtts.push(rep.currentRoundTripTime * 1000);
+  });
+  return rtts.length ? rtts.reduce((a, b) => a + b, 0) / rtts.length : null;
+}
+
+// --- MAIN ENGINE ---
+async function runVoipTest(durationSec) {
+  perSecondData = [];
+  initChart();
+  document.getElementById('exportBtn').style.display = 'none';
+  setStatus('VoIP test running');
+
+  try {
+    const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    const oscillator = audioCtx.createOscillator();
+    const dest = audioCtx.createMediaStreamDestination();
+    oscillator.connect(dest); oscillator.start();
+    const stream = dest.stream;
+
+    pcSender = new RTCPeerConnection(ICE_CONFIG);
+    pcReceiver = new RTCPeerConnection(ICE_CONFIG);
+
+    installCandidateFilter(pcSender, pcReceiver);
+    installCandidateFilter(pcReceiver, pcSender);
+
+    pcReceiver.ontrack = (e) => { document.getElementById('remoteAudio').srcObject = e.streams[0]; };
+    stream.getTracks().forEach(t => pcSender.addTrack(t, stream));
+
+    dataChannel = pcSender.createDataChannel('ping');
+    pcReceiver.ondatachannel = ev => { ev.channel.onmessage = m => ev.channel.send(m.data); };
+
+    const offer = await pcSender.createOffer();
+    await pcSender.setLocalDescription(offer);
+    await pcReceiver.setRemoteDescription(offer);
+    const answer = await pcReceiver.createAnswer();
+    await pcReceiver.setLocalDescription(answer);
+    await pcSender.setRemoteDescription(answer);
+
+    await waitForDcOpenOrConnected(dataChannel, pcSender);
+
+    pingInterval = setInterval(() => {
+      if (dataChannel.readyState === 'open') dataChannel.send(JSON.stringify({ sentTs: performance.now() }));
+    }, 1000);
+
+    dataChannel.onmessage = ev => {
+        const pkt = JSON.parse(ev.data);
+        window.__webrtc_rtts.push(performance.now() - pkt.sentTs);
+    };
+
+    for (let i = durationSec; i >= 1; i--) {
+      setTimerText(`${i}s`);
+      const statsRx = await pcReceiver.getStats();
+      const statsTx = await pcSender.getStats();
+
+      let jitter = 0, loss = 0, rx = 0, lost = 0;
+      statsRx.forEach(r => {
+        if (r.type === 'inbound-rtp' && r.kind === 'audio') {
+          jitter = (r.jitter || 0) * 1000;
+          rx = r.packetsReceived || 0; lost = r.packetsLost || 0;
+          loss = (rx + lost) ? (lost / (rx + lost)) * 100 : 0;
+        }
+      });
+
+      const netRtt = extractOutboundRttMs(statsTx);
+      const latency = netRtt || (window.__webrtc_rtts[window.__webrtc_rtts.length - 1] || 0);
+
+      let R = 94.2 - (latency * 0.03 + jitter * 0.10 + loss * 2.5);
+      R = Math.max(0, Math.min(100, R));
+      const MOS = 1 + 0.035 * R + 0.000007 * R * (R - 60) * (100 - R);
+
+      // Record & Chart Update
+      const secondMark = durationSec - i + 1;
+      perSecondData.push({ time: secondMark, latency: latency.toFixed(2), jitter: jitter.toFixed(2), loss: loss.toFixed(2), mos: MOS.toFixed(2) });
+      
+      chart.data.labels.push(secondMark + 's');
+      chart.data.datasets[0].data.push(MOS.toFixed(2));
+      chart.data.datasets[1].data.push(latency.toFixed(0));
+      chart.update('none');
+
+      document.getElementById('ui-mos').innerText = MOS.toFixed(2);
+      document.getElementById('ui-latency').innerText = Math.round(latency) + "ms";
+      document.getElementById('ui-jitter').innerText = jitter.toFixed(2) + "ms";
+      document.getElementById('ui-loss').innerText = loss.toFixed(1) + "%";
+
+      await new Promise(r => setTimeout(r, 1000));
+    }
+
+    clearInterval(pingInterval);
+    setStatus('Test Complete');
+    document.getElementById('exportBtn').style.display = 'block';
+    pcSender.close(); pcReceiver.close(); oscillator.stop(); audioCtx.close();
+  } catch (err) {
+    setStatus('Error: ' + err.message);
+  }
+}
+
+function downloadCsv() {
+    let csv = "Second,Latency (ms),Jitter (ms),Packet Loss (%),MOS Score\n";
+    perSecondData.forEach(row => { csv += `${row.time},${row.latency},${row.jitter},${row.loss},${row.mos}\n`; });
+    const blob = new Blob([csv], { type: 'text/csv' });
+    const url = window.URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = `VoIP_Report.csv`; a.click();
+}
+</script>
+</body>
+</html>
